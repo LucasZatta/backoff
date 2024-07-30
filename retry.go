@@ -13,6 +13,8 @@ type OperationWithData[T any] func() (T, error)
 // The operation will be retried using a backoff policy if it returns an error.
 type Operation func() error
 
+type StringOperation func(string) error
+
 func (o Operation) withEmptyData() OperationWithData[struct{}] {
 	return func() (struct{}, error) {
 		return struct{}{}, o()
@@ -36,6 +38,10 @@ type Notify func(error, time.Duration)
 // failed operation returns.
 func Retry(o Operation, b BackOff) error {
 	return RetryNotify(o, b, nil)
+}
+
+func RetryString(o StringOperation, b BackOff, p string) error {
+	return doRetryNotify2(o, b, nil, nil, p)
 }
 
 // RetryWithData is like Retry but returns data in the response too.
@@ -112,6 +118,55 @@ func doRetryNotify[T any](operation OperationWithData[T], b BackOff, notify Noti
 		select {
 		case <-ctx.Done():
 			return res, ctx.Err()
+		case <-t.C():
+		}
+	}
+}
+
+func doRetryNotify2(operation StringOperation, b BackOff, notify Notify, t Timer, path string) error {
+	var (
+		err  error
+		next time.Duration
+	)
+	if t == nil {
+		t = &defaultTimer{}
+	}
+
+	defer func() {
+		t.Stop()
+	}()
+
+	ctx := getContext(b)
+
+	b.Reset()
+	for {
+		err = operation(path)
+		if err == nil {
+			return nil
+		}
+
+		var permanent *PermanentError
+		if errors.As(err, &permanent) {
+			return permanent.Err
+		}
+
+		if next = b.NextBackOff(); next == Stop {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+
+			return err
+		}
+
+		if notify != nil {
+			notify(err, next)
+		}
+
+		t.Start(next)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-t.C():
 		}
 	}
